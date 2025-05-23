@@ -3,7 +3,7 @@ import base64
 import json
 import logging
 import random
-from typing import Dict, List, Optional
+from typing import Optional
 from collections.abc import AsyncGenerator
 
 from google import genai
@@ -15,7 +15,7 @@ from astrbot import logger
 from astrbot.api.provider import Personality, Provider
 from astrbot.core.db import BaseDatabase
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.entities import LLMResponse, ToolCallsResult
 from astrbot.core.provider.func_tool_manager import FuncCall
 from astrbot.core.utils.io import download_image_by_url
 
@@ -65,7 +65,7 @@ class ProviderGoogleGenAI(Provider):
             db_helper,
             default_persona,
         )
-        self.api_keys: List = provider_config.get("key", [])
+        self.api_keys: list = provider_config.get("key", [])
         self.chosen_api_key: str = self.api_keys[0] if len(self.api_keys) > 0 else None
         self.timeout: int = int(provider_config.get("timeout", 180))
 
@@ -99,7 +99,7 @@ class ProviderGoogleGenAI(Provider):
             and threshold_str in self.THRESHOLD_MAPPING
         ]
 
-    async def _handle_api_error(self, e: APIError, keys: List[str]) -> bool:
+    async def _handle_api_error(self, e: APIError, keys: list[str]) -> bool:
         """处理API错误，返回是否需要重试"""
         if e.code == 429 or "API key not valid" in e.message:
             keys.remove(self.chosen_api_key)
@@ -126,7 +126,7 @@ class ProviderGoogleGenAI(Provider):
         payloads: dict,
         tools: Optional[FuncCall] = None,
         system_instruction: Optional[str] = None,
-        modalities: Optional[List[str]] = None,
+        modalities: Optional[list[str]] = None,
         temperature: float = 0.7,
     ) -> types.GenerateContentConfig:
         """准备查询配置"""
@@ -162,24 +162,41 @@ class ProviderGoogleGenAI(Provider):
         return types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
-            max_output_tokens=payloads.get("max_tokens") or payloads.get("maxOutputTokens"),
+            max_output_tokens=payloads.get("max_tokens")
+            or payloads.get("maxOutputTokens"),
             top_p=payloads.get("top_p") or payloads.get("topP"),
             top_k=payloads.get("top_k") or payloads.get("topK"),
-            frequency_penalty=payloads.get("frequency_penalty") or payloads.get("frequencyPenalty"),
-            presence_penalty=payloads.get("presence_penalty") or payloads.get("presencePenalty"),
+            frequency_penalty=payloads.get("frequency_penalty")
+            or payloads.get("frequencyPenalty"),
+            presence_penalty=payloads.get("presence_penalty")
+            or payloads.get("presencePenalty"),
             stop_sequences=payloads.get("stop") or payloads.get("stopSequences"),
-            response_logprobs=payloads.get("response_logprobs") or payloads.get("responseLogprobs"),
+            response_logprobs=payloads.get("response_logprobs")
+            or payloads.get("responseLogprobs"),
             logprobs=payloads.get("logprobs"),
             seed=payloads.get("seed"),
             response_modalities=modalities,
             tools=tool_list,
             safety_settings=self.safety_settings if self.safety_settings else None,
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=min(
+                    int(
+                        self.provider_config.get("gm_thinking_config", {}).get(
+                            "budget", 0
+                        )
+                    ),
+                    24576,
+                ),
+            )
+            if "gemini-2.5-flash" in self.get_model()
+            and hasattr(types.ThinkingConfig, "thinking_budget")
+            else None,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
             ),
         )
 
-    def _prepare_conversation(self, payloads: Dict) -> List[types.Content]:
+    def _prepare_conversation(self, payloads: dict) -> list[types.Content]:
         """准备 Gemini SDK 的 Content 列表"""
 
         def create_text_part(text: str) -> types.Part:
@@ -194,13 +211,17 @@ class ProviderGoogleGenAI(Provider):
             image_bytes = base64.b64decode(url.split(",", 1)[1])
             return types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
-        def append_or_extend(contents: list[types.Content], part: list[types.Part], content_cls: type[types.Content]) -> None:
+        def append_or_extend(
+            contents: list[types.Content],
+            part: list[types.Part],
+            content_cls: type[types.Content],
+        ) -> None:
             if contents and isinstance(contents[-1], content_cls):
                 contents[-1].parts.extend(part)
             else:
                 contents.append(content_cls(parts=part))
 
-        gemini_contents: List[types.Content] = []
+        gemini_contents: list[types.Content] = []
         native_tool_enabled = any(
             [
                 self.provider_config.get("gm_native_coderunner", False),
@@ -226,7 +247,7 @@ class ProviderGoogleGenAI(Provider):
                 if content:
                     parts = [types.Part.from_text(text=content)]
                     append_or_extend(gemini_contents, parts, types.ModelContent)
-                elif not native_tool_enabled and "tool_calls" in message :
+                elif not native_tool_enabled and "tool_calls" in message:
                     parts = [
                         types.Part.from_function_call(
                             name=tool["function"]["name"],
@@ -270,19 +291,19 @@ class ProviderGoogleGenAI(Provider):
         result_parts: Optional[types.Part] = result.candidates[0].content.parts
 
         if finish_reason == types.FinishReason.SAFETY:
-            raise Exception("模型生成内容未通过用户定义的内容安全检查")
+            raise Exception("模型生成内容未通过 Gemini 平台的安全检查")
 
         if finish_reason in {
             types.FinishReason.PROHIBITED_CONTENT,
             types.FinishReason.SPII,
             types.FinishReason.BLOCKLIST,
         }:
-            raise Exception("模型生成内容违反Gemini平台政策")
+            raise Exception("模型生成内容违反 Gemini 平台政策")
 
         # 防止旧版本SDK不存在IMAGE_SAFETY
         if hasattr(types.FinishReason, "IMAGE_SAFETY"):
             if finish_reason == types.FinishReason.IMAGE_SAFETY:
-                raise Exception("模型生成内容违反Gemini平台政策")
+                raise Exception("模型生成内容违反 Gemini 平台政策")
 
         if not result_parts:
             logger.debug(result.candidates)
@@ -312,9 +333,7 @@ class ProviderGoogleGenAI(Provider):
                 chain.append(Comp.Image.fromBytes(part.inline_data.data))
         return MessageChain(chain=chain)
 
-    async def _query(
-        self, payloads: dict, tools: FuncCall
-    ) -> LLMResponse:
+    async def _query(self, payloads: dict, tools: FuncCall) -> LLMResponse:
         """非流式请求 Gemini API"""
         system_instruction = next(
             (msg["content"] for msg in payloads["messages"] if msg["role"] == "system"),
@@ -326,7 +345,7 @@ class ProviderGoogleGenAI(Provider):
             modalities.append("Image")
 
         conversation = self._prepare_conversation(payloads)
-        temperature=payloads.get("temperature", 0.7)
+        temperature = payloads.get("temperature", 0.7)
 
         result: Optional[types.GenerateContentResponse] = None
         while True:
@@ -446,13 +465,15 @@ class ProviderGoogleGenAI(Provider):
         self,
         prompt: str,
         session_id: str = None,
-        image_urls: List[str] = None,
+        image_urls: list[str] = None,
         func_tool: FuncCall = None,
-        contexts=[],
-        system_prompt=None,
-        tool_calls_result=None,
+        contexts: list = None,
+        system_prompt: str = None,
+        tool_calls_result: ToolCallsResult = None,
         **kwargs,
     ) -> LLMResponse:
+        if contexts is None:
+            contexts = []
         new_record = await self.assemble_context(prompt, image_urls)
         context_query = [*contexts, new_record]
         if system_prompt:
@@ -486,13 +507,15 @@ class ProviderGoogleGenAI(Provider):
         self,
         prompt: str,
         session_id: str = None,
-        image_urls: List[str] = [],
+        image_urls: list[str] = None,
         func_tool: FuncCall = None,
-        contexts=[],
-        system_prompt=None,
-        tool_calls_result=None,
+        contexts: str = None,
+        system_prompt: str = None,
+        tool_calls_result: ToolCallsResult = None,
         **kwargs,
     ) -> AsyncGenerator[LLMResponse, None]:
+        if contexts is None:
+            contexts = []
         new_record = await self.assemble_context(prompt, image_urls)
         context_query = [*contexts, new_record]
         if system_prompt:
@@ -538,14 +561,14 @@ class ProviderGoogleGenAI(Provider):
     def get_current_key(self) -> str:
         return self.chosen_api_key
 
-    def get_keys(self) -> List[str]:
+    def get_keys(self) -> list[str]:
         return self.api_keys
 
     def set_key(self, key):
         self.chosen_api_key = key
         self._init_client()
 
-    async def assemble_context(self, text: str, image_urls: List[str] = None):
+    async def assemble_context(self, text: str, image_urls: list[str] = None):
         """
         组装上下文。
         """
